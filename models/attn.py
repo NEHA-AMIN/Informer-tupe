@@ -1,23 +1,21 @@
+# attention.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import numpy as np
-
-from math import sqrt
+from math import sqrt, log
 from utils.masking import TriangularCausalMask, ProbMask
-
 
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
-        # Compute the positional encodings once in log space.
         pe = torch.zeros(max_len, d_model).float()
-        pe.require_grad = False
+        pe.requires_grad = False
 
         position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+        div_term = (torch.arange(0, d_model, 2).float() * -(log(10000.0) / d_model)).exp()
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -29,32 +27,33 @@ class PositionalEmbedding(nn.Module):
         return self.pe[:, :x.size(1)]
 
 
-class FullAttention(nn.Module):
-    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
-        super(FullAttention, self).__init__()
+
+class TUPEFullAttention(nn.Module):
+    def __init__(self, mask_flag=True, scale=None, attention_dropout=0.1, output_attention=False):
+        super(TUPEFullAttention, self).__init__()
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
-        
-    def forward(self, Q_x, K_p, Q_p, K_x, V, attn_mask):
+
+    def forward(self, Q_x, K_x, Q_p, K_p, V, attn_mask):
         B, L, H, E = Q_x.shape
         _, S, _, _ = V.shape
-        scale = self.scale or 1. / sqrt(E)
-        #print(Q_x.shape, K_p.shape, Q_p.shape, K_x.shape)
+        scale = self.scale or 1. / sqrt(2 * E)
 
-        # Cross attention terms only
-        scores = torch.einsum("blhe,bshe->bhls", Q_x, K_p) + \
-                 torch.einsum("blhe,bshe->bhls", Q_p, K_x)
-    
+        scores = torch.einsum("blhe,bshe->bhls", Q_x, K_x) + \
+                 torch.einsum("blhe,bshe->bhls", Q_p, K_p)
+
+        scores = scores * scale
+
         if self.mask_flag:
             if attn_mask is None:
                 attn_mask = TriangularCausalMask(B, L, device=Q_x.device)
             scores.masked_fill_(attn_mask.mask, -np.inf)
-    
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+
+        A = self.dropout(torch.softmax(scores, dim=-1))
         out = torch.einsum("bhls,bshd->blhd", A, V)
-    
+
         if self.output_attention:
             return (out.contiguous(), A)
         else:
@@ -151,18 +150,23 @@ class ProbAttention(nn.Module):
         return context.transpose(2,1).contiguous(), attn
 
 
-class AttentionLayer(nn.Module):
-    def __init__(self, attention, d_model, n_heads, 
+class TUPEAttentionLayer(nn.Module):
+    def __init__(self, attention, d_model, n_heads,
                  d_keys=None, d_values=None, mix=False):
-        super(AttentionLayer, self).__init__()
+        super(TUPEAttentionLayer, self).__init__()
 
-        d_keys = d_keys or (d_model//n_heads)
-        d_values = d_values or (d_model//n_heads)
+        d_keys = d_keys or (d_model // n_heads)
+        d_values = d_values or (d_model // n_heads)
 
         self.inner_attention = attention
         self.query_projection = nn.Linear(d_model, d_keys * n_heads)
         self.key_projection = nn.Linear(d_model, d_keys * n_heads)
         self.value_projection = nn.Linear(d_model, d_values * n_heads)
+
+        # Separate projection for positions (U^Q, U^K)
+        self.pos_query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.pos_key_projection = nn.Linear(d_model, d_keys * n_heads)
+
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
         self.n_heads = n_heads
         self.mix = mix
@@ -172,21 +176,19 @@ class AttentionLayer(nn.Module):
         _, S, _ = keys.shape
         H = self.n_heads
         device = queries.device
-        pos_queries = pos_queries.to(device)
-        pos_keys = pos_keys.to(device)
+
         Q_x = self.query_projection(queries).view(B, L, H, -1)
         K_x = self.key_projection(keys).view(B, S, H, -1)
         V = self.value_projection(values).view(B, S, H, -1)
-    
-        Q_p = self.query_projection(pos_queries).view(B, L, H, -1)
-        K_p = self.key_projection(pos_keys).view(B, S, H, -1)
-    
-        out, attn = self.inner_attention(
-            Q_x, K_p, Q_p, K_x, V, attn_mask  # custom attention call
-        )
-    
+
+        Q_p = self.pos_query_projection(pos_queries).view(B, L, H, -1)
+        K_p = self.pos_key_projection(pos_keys).view(B, S, H, -1)
+
+        out, attn = self.inner_attention(Q_x, K_x, Q_p, K_p, V, attn_mask)
+
         if self.mix:
             out = out.transpose(2, 1).contiguous()
         out = out.view(B, L, -1)
         return self.out_projection(out), attn
+
 
